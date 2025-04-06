@@ -10,13 +10,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Configuration
-GEMINI_API_KEY = "AIzaSyCfZzpfygluvpTyqGANIgdRpiilug9xur4"
+GEMINI_API_KEY = "AIzaSyCfZzpfygluvpTyqGANIgdRpiilek9xuy6"
 API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
 DB_PARAMS = {
     "dbname": "pgql",
     "user": "pgql",
-    "password": "postgres",
-    "host": "3.110.135.2",
+    "password": "data",
+    "host": "localhost",
     "port": "5432",
     "connect_timeout": 10
 }
