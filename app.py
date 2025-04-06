@@ -2,8 +2,6 @@ import streamlit as st
 import psycopg2
 from psycopg2 import Error
 import requests
-import time
-import re
 import logging
 from contextlib import contextmanager
 
@@ -20,7 +18,7 @@ DB_PARAMS = {
     "password": "postgres",
     "host": "3.110.135.2",
     "port": "5432",
-    "connect_timeout": 10  # Added timeout
+    "connect_timeout": 10
 }
 
 # Database Functions
@@ -48,8 +46,8 @@ def init_db():
                     CREATE TABLE IF NOT EXISTS code_logs (
                         id SERIAL PRIMARY KEY,
                         original_code TEXT NOT NULL,
-                        optimized_code TEXT NOT NULL,
-                        debug_info TEXT NOT NULL,
+                        corrected_code TEXT NOT NULL,
+                        analysis TEXT NOT NULL,
                         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -58,39 +56,42 @@ def init_db():
     except Exception as e:
         st.error(f"Failed to initialize database: {e}")
 
-def save_to_db(original_code, optimized_code, debug_info):
+def save_to_db(original_code, corrected_code, analysis):
     """Save code analysis to PostgreSQL."""
     try:
         with db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO code_logs (original_code, optimized_code, debug_info) VALUES (%s, %s, %s)",
-                    (original_code, optimized_code, debug_info)
+                    "INSERT INTO code_logs (original_code, corrected_code, analysis) VALUES (%s, %s, %s)",
+                    (original_code, corrected_code, analysis)
                 )
                 conn.commit()
                 logger.info("Code analysis saved to database.")
     except Exception as e:
         st.error(f"Failed to save to database: {e}")
 
-# AI and Rule-Based Optimization Functions
+# Gemini API Function with Best Prompt
 def call_gemini(code):
-    """Call Gemini API for code analysis."""
+    """Call Gemini API for code analysis and correction."""
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
     payload = {
         "contents": [{
             "parts": [{
                 "text": f"""
-                    Analyze this Python code for bugs and optimize it for space/time complexity. Return in this format:
-                    Optimized Code:
-                    [your optimized code here]
-                    Debug Information:
-                    [bugs found, optimizations applied, performance notes]
+                    You are an expert Python code analyst. Analyze the following Python code for bugs, syntax errors, and logical issues. 
+                    Provide a corrected version of the code that is bug-free and functionally correct. Return the response in this exact format:
+                    Corrected Code:
+                    [your corrected code here]
+                    Analysis:
+                    [detailed explanation of bugs found and corrections made]
+                    If no bugs are found, state that explicitly in the Analysis section.
+                    Do not optimize for performance unless it fixes a bug. Preserve the original functionality unless it’s inherently broken.
                     Code:
                     {code}
                 """
             }]
         }],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1500}
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1500}  # Low temperature for precision
     }
     try:
         response = requests.post(API_ENDPOINT, json=payload, headers=headers, timeout=30)
@@ -99,84 +100,36 @@ def call_gemini(code):
         if "candidates" not in data or not data["candidates"]:
             raise ValueError("No valid response from Gemini API.")
         result = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        if "Debug Information:" not in result:
+        if "Analysis:" not in result:
             raise ValueError("Invalid response format from Gemini API.")
-        opt_code, debug_info = result.split("Debug Information:", 1)
-        optimized_code = opt_code.replace("Optimized Code:", "").strip()
-        if not optimized_code or not debug_info.strip():
-            raise ValueError("Empty optimized code or debug info.")
-        return optimized_code, debug_info.strip()
-    except (requests.RequestException, ValueError) as e:
-        logger.warning(f"Gemini API failed: {e}")
-        return None, None
+        corrected_code, analysis = result.split("Analysis:", 1)
+        corrected_code = corrected_code.replace("Corrected Code:", "").strip()
+        analysis = analysis.strip()
+        if not corrected_code or not analysis:
+            raise ValueError("Empty corrected code or analysis.")
+        # Validate corrected code syntax
+        compile(corrected_code, "<string>", "exec")
+        return corrected_code, analysis
+    except (requests.RequestException, ValueError, SyntaxError) as e:
+        logger.warning(f"Gemini API failed or returned invalid code: {e}")
+        return code, f"Error: Failed to analyze code due to {e}. Original code returned."
 
-def rule_based_optimize(code):
-    """Rule-based fallback optimization."""
-    optimized_code = code.strip()
-    debug_info = []
-
-    # Optimization 1: Replace for loops with list comprehensions (improved pattern)
-    loop_pattern = r"for\s+(\w+)\s+in\s+range\((\d+)\):\s*\n\s+(\w+)\.append\(([^)]+)\)"
-    if re.search(loop_pattern, optimized_code, re.MULTILINE):
-        optimized_code = re.sub(
-            loop_pattern,
-            lambda m: f"{m.group(3)} = [{m.group(4)} for {m.group(1)} in range({m.group(2)})]",
-            optimized_code,
-            flags=re.MULTILINE
-        )
-        debug_info.append("Replaced for loop with list comprehension for better time efficiency.")
-
-    # Optimization 2: Remove redundant variables (improved logic)
-    lines = optimized_code.split("\n")
-    assignments = set()
-    used_vars = set()
-    for line in lines:
-        assign_match = re.match(r"^\s*(\w+)\s*=\s*.+$", line.strip())
-        if assign_match:
-            assignments.add(assign_match.group(1))
-        used_matches = re.findall(r"\b(\w+)\b", line)
-        used_vars.update(used_matches)
-    redundant = assignments - used_vars - {"print"}
-    if redundant:
-        optimized_code = "\n".join(line for line in lines if not any(re.match(rf"^\s*{r}\s*=\s*.+$", line.strip()) for r in redundant))
-        debug_info.append(f"Removed redundant variables: {', '.join(redundant)}.")
-
-    # Execution time and safety check
-    start = time.time()
-    try:
-        # Validate syntax before execution
-        compile(optimized_code, "<string>", "exec")
-        exec(optimized_code, {"__builtins__": {}})  # Restricted environment
-        exec_time = time.time() - start
-        debug_info.append(f"Execution Time: {exec_time:.6f}s")
-    except SyntaxError as e:
-        debug_info.append(f"Syntax Error: {e}")
-    except Exception as e:
-        debug_info.append(f"Runtime Error: {e}")
-
-    return optimized_code, "\n".join(debug_info) if debug_info else "No optimizations applied."
-
-def optimize_and_debug(code):
-    """Main function to optimize and debug code."""
+# Main Analysis Function
+def analyze_and_correct(code):
+    """Analyze and correct the code using Gemini API."""
     if not code.strip():
         return "", "Error: No code provided."
     if len(code.splitlines()) > 1000:
         return code, "Error: Code exceeds 1000 lines."
-
-    # Try Gemini API first
-    opt_code, debug_info = call_gemini(code)
-    if opt_code and debug_info:
-        return opt_code, debug_info
-
-    # Fallback to rule-based
-    logger.info("Falling back to rule-based optimization.")
-    return rule_based_optimize(code)
+    
+    corrected_code, analysis = call_gemini(code)
+    return corrected_code, analysis
 
 # Streamlit Frontend
 def main():
     st.set_page_config(page_title="CodeSynapse", layout="wide")
-    st.title("CodeSynapse: AI Code Debugger & Enhancer")
-    st.markdown("Optimize and debug Python code with AI-powered analysis using Gemini API. Supports up to 1000 lines.")
+    st.title("CodeSynapse: AI Code Corrector")
+    st.markdown("Analyze and correct Python code using Google's Gemini API. Supports up to 1000 lines.")
 
     # Initialize database
     init_db()
@@ -186,30 +139,30 @@ def main():
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        if st.button("Optimize & Debug", key="run"):
+        if st.button("Analyze & Correct", key="run"):
             if not code_input.strip():
                 st.error("Please enter some code.")
             else:
                 with st.spinner("Analyzing code with Gemini AI..."):
                     try:
-                        optimized_code, debug_info = optimize_and_debug(code_input)
-                        st.session_state["result"] = (optimized_code, debug_info)
-                        save_to_db(code_input, optimized_code, debug_info)
+                        corrected_code, analysis = analyze_and_correct(code_input)
+                        st.session_state["result"] = (corrected_code, analysis)
+                        save_to_db(code_input, corrected_code, analysis)
                         st.success("Analysis saved to database!")
                     except Exception as e:
                         st.error(f"Analysis failed: {e}")
 
     # Display results
     if "result" in st.session_state:
-        opt_code, debug = st.session_state["result"]
-        st.subheader("Enhanced Code")
-        st.code(opt_code, language="python")
-        st.subheader("Debug Information")
-        st.text(debug)
+        corrected_code, analysis = st.session_state["result"]
+        st.subheader("Corrected Code")
+        st.code(corrected_code, language="python")
+        st.subheader("Analysis")
+        st.text(analysis)
 
     with col2:
         st.markdown("### About")
-        st.write("CodeSynapse leverages Google's Gemini API for intelligent code enhancement, with a rule-based fallback for reliability.")
+        st.write("CodeSynapse uses Google's Gemini API to analyze and correct Python code, ensuring bug-free functionality.")
 
 if __name__ == "__main__":
     main()
